@@ -53,13 +53,19 @@ export class InpaintClient {
     rect: InpaintRect,
   ): Promise<InpaintRunResult> {
     const copied = new Uint8ClampedArray(imageData.data);
+    const rectCopy: InpaintRect = {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+    };
     const response = (await this.request(
       {
         type: "run",
         width: imageData.width,
         height: imageData.height,
         pixels: copied,
-        rect,
+        rect: rectCopy,
       },
       [copied.buffer],
     )) as Extract<InpaintWorkerResponse, { type: "run" }>;
@@ -69,6 +75,7 @@ export class InpaintClient {
       height: response.height,
       pixels: response.pixels,
       backend: response.backend,
+      message: response.message,
     };
   }
 

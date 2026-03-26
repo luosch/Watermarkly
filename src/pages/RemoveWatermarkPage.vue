@@ -7,7 +7,8 @@ import type { InpaintBackend } from "../services/inpaint/types";
 type SelectionRect = {
   x: number;
   y: number;
-  size: number;
+  width: number;
+  height: number;
 };
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -35,7 +36,7 @@ const selectionStartY = ref(0);
 
 const exportFormat = ref<"png" | "jpeg">("png");
 const exportQuality = ref(92);
-const modelUrl = import.meta.env.VITE_INPAINT_MODEL_URL || "/models/inpaint.onnx";
+const modelUrl = import.meta.env.VITE_INPAINT_MODEL_URL || "/models/migan_pipeline_v2.onnx";
 
 const workingCanvas = document.createElement("canvas");
 const workingCtx = workingCanvas.getContext("2d");
@@ -150,13 +151,14 @@ function drawPreview() {
   if (selection.value) {
     const x = selection.value.x * previewScale.value;
     const y = selection.value.y * previewScale.value;
-    const size = selection.value.size * previewScale.value;
+    const width = selection.value.width * previewScale.value;
+    const height = selection.value.height * previewScale.value;
     ctx.save();
     ctx.fillStyle = "rgba(59, 130, 246, 0.2)";
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 2;
-    ctx.fillRect(x, y, size, size);
-    ctx.strokeRect(x, y, size, size);
+    ctx.fillRect(x, y, width, height);
+    ctx.strokeRect(x, y, width, height);
     ctx.restore();
   }
 }
@@ -184,7 +186,7 @@ function onCanvasMouseDown(event: MouseEvent) {
   isSelecting.value = true;
   selectionStartX.value = point.x;
   selectionStartY.value = point.y;
-  selection.value = { x: point.x, y: point.y, size: 0 };
+  selection.value = { x: point.x, y: point.y, width: 1, height: 1 };
   drawPreview();
 }
 
@@ -194,21 +196,21 @@ function onCanvasMouseMove(event: MouseEvent) {
   const dx = point.x - selectionStartX.value;
   const dy = point.y - selectionStartY.value;
 
-  const rawSize = Math.max(Math.abs(dx), Math.abs(dy));
-  const maxSize = Math.min(workingCanvas.width, workingCanvas.height);
-  const size = Math.max(1, Math.min(rawSize, maxSize));
-  const x = dx >= 0 ? selectionStartX.value : selectionStartX.value - size;
-  const y = dy >= 0 ? selectionStartY.value : selectionStartY.value - size;
+  const x = Math.min(selectionStartX.value, point.x);
+  const y = Math.min(selectionStartY.value, point.y);
+  const rawWidth = Math.abs(dx);
+  const rawHeight = Math.abs(dy);
 
-  const maxX = Math.max(0, workingCanvas.width - size);
-  const maxY = Math.max(0, workingCanvas.height - size);
-  const clampedX = Math.max(0, Math.min(maxX, x));
-  const clampedY = Math.max(0, Math.min(maxY, y));
+  const clampedX = Math.max(0, Math.min(workingCanvas.width - 1, x));
+  const clampedY = Math.max(0, Math.min(workingCanvas.height - 1, y));
+  const width = Math.max(1, Math.min(rawWidth, workingCanvas.width - clampedX));
+  const height = Math.max(1, Math.min(rawHeight, workingCanvas.height - clampedY));
 
   selection.value = {
     x: clampedX,
     y: clampedY,
-    size,
+    width,
+    height,
   };
   drawPreview();
 }
@@ -229,16 +231,19 @@ async function removeSelectionWatermark() {
     workingCtx.putImageData(output, 0, 0);
     engineBackend.value = result.backend;
     engineMessage.value =
-      result.backend === "webgpu"
+      result.message ||
+      (result.backend === "webgpu"
         ? "当前使用 WebGPU 推理"
         : result.backend === "wasm"
           ? "当前使用 WASM 推理"
-          : "当前使用降级算法";
+          : "当前使用降级算法");
     drawPreview();
   } finally {
     await keepLoadingAtLeast(start, 350);
     processing.value = false;
     selectionMode.value = false;
+    selection.value = null;
+    drawPreview();
   }
 }
 
@@ -322,7 +327,7 @@ onBeforeUnmount(() => {
             :disabled="!hasImage || processing"
             @click="toggleSelectionMode"
           >
-            {{ selectionMode ? "取消选区" : "选择方形区域" }}
+            {{ selectionMode ? "取消选区" : "选择矩形区域" }}
           </button>
           <button
             class="secondary-btn"
@@ -391,7 +396,7 @@ onBeforeUnmount(() => {
         <p class="sidebar-title">操作说明</p>
         <ol class="help-list">
           <li>添加图片或拖拽图片到画布区域。</li>
-          <li>点击“选择方形区域”，在图片上拖拽出方形选区。</li>
+          <li>点击“选择矩形区域”，在图片上拖拽出矩形选区。</li>
           <li>点击“去掉选区水印”执行处理。</li>
           <li>处理完成后可继续选区，最后导出图片。</li>
         </ol>
