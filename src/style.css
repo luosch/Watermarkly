@@ -272,6 +272,15 @@ body,
   display: flex;
   gap: 10px;
   margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.brush-row {
+  margin-bottom: 12px;
+}
+
+.brush-field {
+  max-width: 320px;
 }
 
 .hidden-input {

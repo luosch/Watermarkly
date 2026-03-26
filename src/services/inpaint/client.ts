@@ -1,14 +1,13 @@
 import InpaintWorker from "./worker?worker";
 import type {
   InpaintInitResult,
-  InpaintRect,
   InpaintRunResult,
   InpaintWorkerRequest,
   InpaintWorkerResponse,
 } from "./types";
 
 type Pending = {
-  resolve: (value: unknown) => void;
+  resolve: (value: InpaintWorkerResponse) => void;
   reject: (reason?: unknown) => void;
 };
 
@@ -50,24 +49,19 @@ export class InpaintClient {
 
   async run(
     imageData: ImageData,
-    rect: InpaintRect,
+    mask: Uint8Array,
   ): Promise<InpaintRunResult> {
     const copied = new Uint8ClampedArray(imageData.data);
-    const rectCopy: InpaintRect = {
-      x: rect.x,
-      y: rect.y,
-      width: rect.width,
-      height: rect.height,
-    };
+    const maskCopy = new Uint8Array(mask);
     const response = (await this.request(
       {
         type: "run",
         width: imageData.width,
         height: imageData.height,
         pixels: copied,
-        rect: rectCopy,
+        mask: maskCopy,
       },
-      [copied.buffer],
+      [copied.buffer, maskCopy.buffer],
     )) as Extract<InpaintWorkerResponse, { type: "run" }>;
 
     return {
@@ -85,14 +79,16 @@ export class InpaintClient {
   }
 
   private request(
-    payload: Omit<InpaintWorkerRequest, "id">,
+    payload:
+      | Omit<Extract<InpaintWorkerRequest, { type: "init" }>, "id">
+      | Omit<Extract<InpaintWorkerRequest, { type: "run" }>, "id">,
     transfer?: Transferable[],
   ) {
     const id = this.seq++;
 
     return new Promise<InpaintWorkerResponse>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      const message: InpaintWorkerRequest = { ...payload, id } as InpaintWorkerRequest;
+      const message: InpaintWorkerRequest = { ...payload, id };
       this.worker.postMessage(message, transfer ?? []);
     });
   }

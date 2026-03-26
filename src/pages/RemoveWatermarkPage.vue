@@ -4,13 +4,6 @@ import { RouterLink } from "vue-router";
 import { createInpaintClient } from "../services/inpaint/client";
 import type { InpaintBackend } from "../services/inpaint/types";
 
-type SelectionRect = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const fileInputRef = ref<HTMLInputElement | null>(null);
 
@@ -28,11 +21,17 @@ const modelInitializing = ref(false);
 const engineBackend = ref<InpaintBackend>("fallback");
 const engineMessage = ref("未初始化");
 
-const selectionMode = ref(false);
-const isSelecting = ref(false);
-const selection = ref<SelectionRect | null>(null);
-const selectionStartX = ref(0);
-const selectionStartY = ref(0);
+const brushMode = ref(false);
+const brushSize = ref(48);
+const isPainting = ref(false);
+const lastPaintX = ref(0);
+const lastPaintY = ref(0);
+const hasBrushPaint = ref(false);
+const rectMode = ref(false);
+const isSelectingRect = ref(false);
+const rectStartX = ref(0);
+const rectStartY = ref(0);
+const rectSelection = ref<{ x: number; y: number; width: number; height: number } | null>(null);
 
 const exportFormat = ref<"png" | "jpeg">("png");
 const exportQuality = ref(92);
@@ -40,6 +39,10 @@ const modelUrl = import.meta.env.VITE_INPAINT_MODEL_URL || "/models/migan_pipeli
 
 const workingCanvas = document.createElement("canvas");
 const workingCtx = workingCanvas.getContext("2d");
+const maskCanvas = document.createElement("canvas");
+const maskCtx = maskCanvas.getContext("2d");
+const maskBuffer = ref<Uint8Array | null>(null);
+
 const inpaintClient = createInpaintClient();
 
 const hasImage = computed(() => workingCanvas.width > 0 && workingCanvas.height > 0);
@@ -82,7 +85,6 @@ async function loadSourceImage(file: File) {
 
   try {
     const image = await loadImageFromObjectUrl(url);
-
     if (sourceObjectUrl.value) {
       URL.revokeObjectURL(sourceObjectUrl.value);
     }
@@ -92,18 +94,18 @@ async function loadSourceImage(file: File) {
     fitImageToPreview(image.width, image.height);
     workingCanvas.width = image.width;
     workingCanvas.height = image.height;
-    if (!workingCtx) throw new Error("canvas init failed");
+    maskCanvas.width = image.width;
+    maskCanvas.height = image.height;
+    maskBuffer.value = new Uint8Array(image.width * image.height);
+    if (!workingCtx || !maskCtx) throw new Error("canvas init failed");
+
     workingCtx.clearRect(0, 0, image.width, image.height);
     workingCtx.drawImage(image, 0, 0, image.width, image.height);
+    clearBrushMask();
 
-    selection.value = null;
-    selectionMode.value = false;
     await nextTick();
     drawPreview();
-
-    if (engineMessage.value === "未初始化") {
-      void initInpaintEngine();
-    }
+    if (engineMessage.value === "未初始化") void initInpaintEngine();
   } catch {
     URL.revokeObjectURL(url);
     alert("图片加载失败，请重试");
@@ -137,6 +139,16 @@ function fitImageToPreview(imageWidth: number, imageHeight: number) {
   canvasHeight.value = Math.max(220, Math.round(imageHeight * scale));
 }
 
+function clearBrushMask() {
+  if (!maskBuffer.value) return;
+  maskBuffer.value.fill(0);
+  hasBrushPaint.value = false;
+  if (maskCtx) {
+    maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+  }
+  drawPreview();
+}
+
 function drawPreview() {
   if (!canvasRef.value || !hasImage.value) return;
   const canvas = canvasRef.value;
@@ -148,14 +160,18 @@ function drawPreview() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(workingCanvas, 0, 0, canvas.width, canvas.height);
 
-  if (selection.value) {
-    const x = selection.value.x * previewScale.value;
-    const y = selection.value.y * previewScale.value;
-    const width = selection.value.width * previewScale.value;
-    const height = selection.value.height * previewScale.value;
+  if (hasBrushPaint.value) {
+    ctx.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
+  }
+
+  if (rectSelection.value) {
+    const x = rectSelection.value.x * previewScale.value;
+    const y = rectSelection.value.y * previewScale.value;
+    const width = rectSelection.value.width * previewScale.value;
+    const height = rectSelection.value.height * previewScale.value;
     ctx.save();
-    ctx.fillStyle = "rgba(59, 130, 246, 0.2)";
-    ctx.strokeStyle = "#2563eb";
+    ctx.fillStyle = "rgba(34, 197, 94, 0.18)";
+    ctx.strokeStyle = "#16a34a";
     ctx.lineWidth = 2;
     ctx.fillRect(x, y, width, height);
     ctx.strokeRect(x, y, width, height);
@@ -163,71 +179,170 @@ function drawPreview() {
   }
 }
 
-function toggleSelectionMode() {
+function toggleBrushMode() {
   if (!hasImage.value) return;
-  selectionMode.value = !selectionMode.value;
+  if (!brushMode.value) rectMode.value = false;
+  brushMode.value = !brushMode.value;
+}
+
+function toggleRectMode() {
+  if (!hasImage.value) return;
+  if (!rectMode.value) brushMode.value = false;
+  rectMode.value = !rectMode.value;
+}
+
+function clearRectSelection() {
+  rectSelection.value = null;
+  drawPreview();
 }
 
 function getImagePoint(event: MouseEvent) {
   if (!canvasRef.value) return { x: 0, y: 0 };
   const rect = canvasRef.value.getBoundingClientRect();
   return {
-    x: Math.max(0, Math.min(workingCanvas.width, (event.clientX - rect.left) / previewScale.value)),
+    x: Math.max(0, Math.min(workingCanvas.width - 1, (event.clientX - rect.left) / previewScale.value)),
     y: Math.max(
       0,
-      Math.min(workingCanvas.height, (event.clientY - rect.top) / previewScale.value),
+      Math.min(workingCanvas.height - 1, (event.clientY - rect.top) / previewScale.value),
     ),
   };
 }
 
 function onCanvasMouseDown(event: MouseEvent) {
-  if (!selectionMode.value || !hasImage.value || processing.value) return;
   const point = getImagePoint(event);
-  isSelecting.value = true;
-  selectionStartX.value = point.x;
-  selectionStartY.value = point.y;
-  selection.value = { x: point.x, y: point.y, width: 1, height: 1 };
-  drawPreview();
+  if (!hasImage.value || processing.value) return;
+
+  if (rectMode.value) {
+    isSelectingRect.value = true;
+    rectStartX.value = point.x;
+    rectStartY.value = point.y;
+    rectSelection.value = { x: point.x, y: point.y, width: 1, height: 1 };
+    drawPreview();
+    return;
+  }
+
+  if (brushMode.value) {
+    isPainting.value = true;
+    lastPaintX.value = point.x;
+    lastPaintY.value = point.y;
+    paintBrush(point.x, point.y);
+  }
 }
 
 function onCanvasMouseMove(event: MouseEvent) {
-  if (!isSelecting.value || !hasImage.value) return;
   const point = getImagePoint(event);
-  const dx = point.x - selectionStartX.value;
-  const dy = point.y - selectionStartY.value;
+  if (!hasImage.value) return;
 
-  const x = Math.min(selectionStartX.value, point.x);
-  const y = Math.min(selectionStartY.value, point.y);
-  const rawWidth = Math.abs(dx);
-  const rawHeight = Math.abs(dy);
+  if (isSelectingRect.value) {
+    const x = Math.min(rectStartX.value, point.x);
+    const y = Math.min(rectStartY.value, point.y);
+    const width = Math.max(1, Math.abs(point.x - rectStartX.value));
+    const height = Math.max(1, Math.abs(point.y - rectStartY.value));
+    rectSelection.value = { x, y, width, height };
+    drawPreview();
+    return;
+  }
 
-  const clampedX = Math.max(0, Math.min(workingCanvas.width - 1, x));
-  const clampedY = Math.max(0, Math.min(workingCanvas.height - 1, y));
-  const width = Math.max(1, Math.min(rawWidth, workingCanvas.width - clampedX));
-  const height = Math.max(1, Math.min(rawHeight, workingCanvas.height - clampedY));
-
-  selection.value = {
-    x: clampedX,
-    y: clampedY,
-    width,
-    height,
-  };
-  drawPreview();
+  if (isPainting.value) {
+    paintLine(lastPaintX.value, lastPaintY.value, point.x, point.y);
+    lastPaintX.value = point.x;
+    lastPaintY.value = point.y;
+  }
 }
 
 function onCanvasMouseUp() {
-  isSelecting.value = false;
+  isPainting.value = false;
+  isSelectingRect.value = false;
+}
+
+function paintLine(x0: number, y0: number, x1: number, y1: number) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const distance = Math.max(Math.abs(dx), Math.abs(dy));
+  if (distance < 1) {
+    paintBrush(x1, y1);
+    return;
+  }
+
+  for (let i = 0; i <= distance; i += 1) {
+    const t = i / distance;
+    paintBrush(x0 + dx * t, y0 + dy * t);
+  }
+}
+
+function paintBrush(cx: number, cy: number) {
+  if (!maskBuffer.value || !maskCtx) return;
+  const radius = Math.max(2, Math.floor(brushSize.value / 2));
+  const minX = Math.max(0, Math.floor(cx - radius));
+  const maxX = Math.min(workingCanvas.width - 1, Math.ceil(cx + radius));
+  const minY = Math.max(0, Math.floor(cy - radius));
+  const maxY = Math.min(workingCanvas.height - 1, Math.ceil(cy + radius));
+  const r2 = radius * radius;
+
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      const dx = x - cx;
+      const dy = y - cy;
+      if (dx * dx + dy * dy > r2) continue;
+      maskBuffer.value[y * workingCanvas.width + x] = 255;
+    }
+  }
+  hasBrushPaint.value = true;
+  maskCtx.save();
+  maskCtx.fillStyle = "rgba(59, 130, 246, 0.55)";
+  maskCtx.beginPath();
+  maskCtx.arc(cx, cy, radius, 0, Math.PI * 2);
+  maskCtx.fill();
+  maskCtx.restore();
+  drawPreview();
+}
+
+function hasMaskPainted() {
+  return hasBrushPaint.value;
+}
+
+function hasRectSelection() {
+  return !!rectSelection.value && rectSelection.value.width > 0 && rectSelection.value.height > 0;
+}
+
+function buildRunMask() {
+  const mask = new Uint8Array(workingCanvas.width * workingCanvas.height);
+  if (maskBuffer.value) {
+    mask.set(maskBuffer.value);
+  }
+
+  if (rectSelection.value) {
+    const x0 = Math.max(0, Math.floor(rectSelection.value.x));
+    const y0 = Math.max(0, Math.floor(rectSelection.value.y));
+    const x1 = Math.min(workingCanvas.width, Math.ceil(rectSelection.value.x + rectSelection.value.width));
+    const y1 = Math.min(
+      workingCanvas.height,
+      Math.ceil(rectSelection.value.y + rectSelection.value.height),
+    );
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = x0; x < x1; x += 1) {
+        mask[y * workingCanvas.width + x] = 255;
+      }
+    }
+  }
+  return mask;
 }
 
 async function removeSelectionWatermark() {
-  if (!workingCtx || !selection.value || processing.value) return;
+  if (!workingCtx || !maskBuffer.value || processing.value) return;
+  if (!hasMaskPainted() && !hasRectSelection()) {
+    alert("请先用画笔或矩形选取要去除的区域");
+    return;
+  }
+
   processing.value = true;
   const start = performance.now();
 
   try {
     const imageData = workingCtx.getImageData(0, 0, workingCanvas.width, workingCanvas.height);
-    const result = await inpaintClient.run(imageData, selection.value);
-    const output = new ImageData(result.pixels, result.width, result.height);
+    const result = await inpaintClient.run(imageData, buildRunMask());
+    const outputPixels = new Uint8ClampedArray(result.pixels);
+    const output = new ImageData(outputPixels, result.width, result.height);
     workingCtx.putImageData(output, 0, 0);
     engineBackend.value = result.backend;
     engineMessage.value =
@@ -237,13 +352,15 @@ async function removeSelectionWatermark() {
         : result.backend === "wasm"
           ? "当前使用 WASM 推理"
           : "当前使用降级算法");
+
+    clearBrushMask();
+    clearRectSelection();
+    brushMode.value = false;
+    rectMode.value = false;
     drawPreview();
   } finally {
     await keepLoadingAtLeast(start, 350);
     processing.value = false;
-    selectionMode.value = false;
-    selection.value = null;
-    drawPreview();
   }
 }
 
@@ -298,9 +415,7 @@ async function keepLoadingAtLeast(startAt: number, minimumMs: number) {
 }
 
 onBeforeUnmount(() => {
-  if (sourceObjectUrl.value) {
-    URL.revokeObjectURL(sourceObjectUrl.value);
-  }
+  if (sourceObjectUrl.value) URL.revokeObjectURL(sourceObjectUrl.value);
   inpaintClient.destroy();
 });
 </script>
@@ -321,21 +436,25 @@ onBeforeUnmount(() => {
           <button class="primary-btn" type="button" :disabled="imageLoading" @click="triggerFileSelect">
             {{ imageLoading ? "加载中..." : "添加图片" }}
           </button>
-          <button
-            class="secondary-btn"
-            type="button"
-            :disabled="!hasImage || processing"
-            @click="toggleSelectionMode"
-          >
-            {{ selectionMode ? "取消选区" : "选择矩形区域" }}
+          <button class="secondary-btn" type="button" :disabled="!hasImage || processing" @click="toggleBrushMode">
+            {{ brushMode ? "结束涂抹" : "画笔涂抹" }}
+          </button>
+          <button class="secondary-btn" type="button" :disabled="!hasImage || processing" @click="toggleRectMode">
+            {{ rectMode ? "结束矩形选取" : "矩形选取" }}
+          </button>
+          <button class="secondary-btn" type="button" :disabled="!hasImage || processing" @click="clearBrushMask">
+            清空涂抹
+          </button>
+          <button class="secondary-btn" type="button" :disabled="!hasImage || processing" @click="clearRectSelection">
+            清空矩形
           </button>
           <button
             class="secondary-btn"
             type="button"
-            :disabled="!selection || processing"
+            :disabled="!hasImage || processing || (!hasMaskPainted() && !hasRectSelection())"
             @click="removeSelectionWatermark"
           >
-            {{ processing ? "处理中..." : "去掉选区水印" }}
+            {{ processing ? "处理中..." : "去掉选中区域水印" }}
           </button>
           <input
             ref="fileInputRef"
@@ -346,12 +465,19 @@ onBeforeUnmount(() => {
           />
         </div>
 
+        <div class="brush-row">
+          <label class="field brush-field">
+            <span>画笔大小（{{ brushSize }}）</span>
+            <input v-model.number="brushSize" type="range" min="8" max="200" step="1" />
+          </label>
+        </div>
+
         <div
           class="dropzone"
           :class="{
             dragging: isDragOver,
             loading: imageLoading || processing || modelInitializing,
-            selecting: selectionMode,
+            selecting: brushMode,
           }"
           @dragenter.prevent="isDragOver = true"
           @dragover.prevent="isDragOver = true"
@@ -372,7 +498,7 @@ onBeforeUnmount(() => {
             <canvas
               ref="canvasRef"
               class="preview-canvas"
-              :class="{ selecting: selectionMode }"
+              :class="{ selecting: brushMode || rectMode }"
               :width="canvasWidth"
               :height="canvasHeight"
               @mousedown="onCanvasMouseDown"
@@ -396,9 +522,9 @@ onBeforeUnmount(() => {
         <p class="sidebar-title">操作说明</p>
         <ol class="help-list">
           <li>添加图片或拖拽图片到画布区域。</li>
-          <li>点击“选择矩形区域”，在图片上拖拽出矩形选区。</li>
-          <li>点击“去掉选区水印”执行处理。</li>
-          <li>处理完成后可继续选区，最后导出图片。</li>
+          <li>点击“画笔涂抹”或“矩形选取”，选择要去除的区域。</li>
+          <li>点击“去掉选中区域水印”执行处理。</li>
+          <li>处理完成后会自动清空选取层，可继续下一次处理。</li>
         </ol>
 
         <hr class="panel-divider" />

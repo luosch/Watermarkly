@@ -2,12 +2,7 @@
 
 import * as ortWasm from "onnxruntime-web";
 import * as ortWebGpu from "onnxruntime-web/webgpu";
-import type {
-  InpaintBackend,
-  InpaintRect,
-  InpaintWorkerRequest,
-  InpaintWorkerResponse,
-} from "./types";
+import type { InpaintBackend, InpaintWorkerRequest, InpaintWorkerResponse } from "./types";
 
 type EngineState = {
   backend: InpaintBackend;
@@ -31,17 +26,13 @@ ctx.onmessage = async (event: MessageEvent<InpaintWorkerRequest>) => {
   try {
     if (payload.type === "init") {
       const result = await initEngine(payload.modelUrl);
-      const response: InpaintWorkerResponse = {
-        id: payload.id,
-        type: "init",
-        ...result,
-      };
+      const response: InpaintWorkerResponse = { id: payload.id, type: "init", ...result };
       ctx.postMessage(response);
       return;
     }
 
     if (payload.type === "run") {
-      const output = await runInpaint(payload.pixels, payload.width, payload.height, payload.rect);
+      const output = await runInpaint(payload.pixels, payload.width, payload.height, payload.mask);
       const response: InpaintWorkerResponse = {
         id: payload.id,
         type: "run",
@@ -104,11 +95,11 @@ async function runInpaint(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
-  rect: InpaintRect,
+  mask: Uint8Array,
 ) {
   if (state.session) {
     try {
-      const output = await runWithOrt(pixels, width, height, rect, state.session);
+      const output = await runWithOrt(pixels, width, height, mask, state.session);
       return {
         pixels: output,
         message: state.backend === "webgpu" ? "WebGPU 推理成功" : "WASM 推理成功",
@@ -120,14 +111,14 @@ async function runInpaint(
       state.session = null;
       state.ready = false;
       return {
-        pixels: runFallback(pixels, width, height, rect),
+        pixels: runFallback(pixels, width, height, mask),
         message: `模型推理失败，已降级：${message} | ${signature}`,
       };
     }
   }
 
   return {
-    pixels: runFallback(pixels, width, height, rect),
+    pixels: runFallback(pixels, width, height, mask),
     message: "模型未就绪，使用降级算法",
   };
 }
@@ -136,7 +127,7 @@ async function runWithOrt(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
-  rect: InpaintRect,
+  mask: Uint8Array,
   session: any,
 ) {
   const imageName = session.inputNames[0];
@@ -168,7 +159,7 @@ async function runWithOrt(
         pixels,
         width,
         height,
-        rect,
+        mask,
         imageName,
         maskName,
         dtype: attempt.dtype,
@@ -189,7 +180,7 @@ async function runWithOrtAttempt(params: {
   pixels: Uint8ClampedArray;
   width: number;
   height: number;
-  rect: InpaintRect;
+  mask: Uint8Array;
   imageName: string;
   maskName: string;
   dtype: TensorDType;
@@ -202,7 +193,7 @@ async function runWithOrtAttempt(params: {
     pixels,
     width,
     height,
-    rect,
+    mask,
     imageName,
     maskName,
     dtype,
@@ -230,18 +221,10 @@ async function runWithOrtAttempt(params: {
   );
 
   const resizedPixels = resizeRgba(pixels, width, height, modelWidth, modelHeight);
-  const scaledRect = {
-    x: (rect.x / width) * modelWidth,
-    y: (rect.y / height) * modelHeight,
-    width: Math.max((rect.width / width) * modelWidth, 1),
-    height: Math.max((rect.height / height) * modelHeight, 1),
-  };
-
-  const preparedImage = maskInputImage
-    ? fillRectOnRgba(resizedPixels, modelWidth, modelHeight, scaledRect, 255)
-    : resizedPixels;
+  const resizedMask = resizeMask(mask, width, height, modelWidth, modelHeight);
+  const preparedImage = maskInputImage ? fillMaskOnRgba(resizedPixels, resizedMask, 255) : resizedPixels;
   const inputImage = createImageTensorData(preparedImage, modelWidth, modelHeight, imageLayout, dtype);
-  const inputMask = createMaskTensorData(modelWidth, modelHeight, scaledRect, dtype, invertMask);
+  const inputMask = createMaskTensorData(resizedMask, dtype, invertMask);
 
   const imageShape =
     imageLayout === "nhwc" ? [1, modelHeight, modelWidth, 3] : [1, 3, modelHeight, modelWidth];
@@ -270,18 +253,11 @@ async function runWithOrtAttempt(params: {
         ? nchwUint8ToRgbaUint8(output.data as Uint8Array, modelWidth, modelHeight)
         : nchwFloatToRgbaUint8(output.data as Float32Array, modelWidth, modelHeight);
 
-  if (!hasMeaningfulChangeInRect(resizedPixels, modelOutputRgba, modelWidth, modelHeight, scaledRect)) {
-    throw new Error("模型输出在选区内无明显变化，尝试其他掩码语义");
+  if (!hasMeaningfulChangeInMask(resizedPixels, modelOutputRgba, resizedMask)) {
+    throw new Error("模型输出在涂抹区域内无明显变化，尝试其他掩码语义");
   }
 
-  const composited = compositeInsideRect(
-    resizedPixels,
-    modelOutputRgba,
-    modelWidth,
-    modelHeight,
-    scaledRect,
-  );
-
+  const composited = compositeInsideMask(resizedPixels, modelOutputRgba, resizedMask);
   return resizeRgba(composited, modelWidth, modelHeight, width, height);
 }
 
@@ -293,33 +269,29 @@ function createImageTensorData(
   dtype: TensorDType,
 ) {
   if (dtype === "uint8") {
-    return layout === "nhwc" ? rgbaToNhwcUint8(pixels, width, height) : rgbaToNchwUint8(pixels, width, height);
+    return layout === "nhwc"
+      ? rgbaToNhwcUint8(pixels, width, height)
+      : rgbaToNchwUint8(pixels, width, height);
   }
-  return layout === "nhwc" ? rgbaToNhwcFloat32(pixels, width, height) : rgbaToNchwFloat32(pixels, width, height);
+  return layout === "nhwc"
+    ? rgbaToNhwcFloat32(pixels, width, height)
+    : rgbaToNchwFloat32(pixels, width, height);
 }
 
-function createMaskTensorData(
-  width: number,
-  height: number,
-  rect: InpaintRect,
-  dtype: TensorDType,
-  invertMask: boolean,
-) {
-  const insideValue = dtype === "uint8" ? (invertMask ? 0 : 255) : invertMask ? 0 : 1;
-  const outsideValue = dtype === "uint8" ? (invertMask ? 255 : 0) : invertMask ? 1 : 0;
-  const out = dtype === "uint8" ? new Uint8Array(width * height) : new Float32Array(width * height);
-  out.fill(outsideValue as any);
-  const x0 = Math.max(0, Math.floor(rect.x));
-  const y0 = Math.max(0, Math.floor(rect.y));
-  const rectW = Math.max(1, Math.floor(rect.width));
-  const rectH = Math.max(1, Math.floor(rect.height));
-  const x1 = Math.min(width, x0 + rectW);
-  const y1 = Math.min(height, y0 + rectH);
-
-  for (let y = y0; y < y1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      out[y * width + x] = insideValue as any;
+function createMaskTensorData(mask: Uint8Array, dtype: TensorDType, invertMask: boolean) {
+  if (dtype === "uint8") {
+    const out = new Uint8Array(mask.length);
+    for (let i = 0; i < mask.length; i += 1) {
+      const base = mask[i] > 0 ? 255 : 0;
+      out[i] = invertMask ? 255 - base : base;
     }
+    return out;
+  }
+
+  const out = new Float32Array(mask.length);
+  for (let i = 0; i < mask.length; i += 1) {
+    const base = mask[i] > 0 ? 1 : 0;
+    out[i] = invertMask ? 1 - base : base;
   }
   return out;
 }
@@ -338,8 +310,7 @@ function rgbaToNchwFloat32(pixels: Uint8ClampedArray, width: number, height: num
 
 function rgbaToNhwcFloat32(pixels: Uint8ClampedArray, width: number, height: number) {
   const out = new Float32Array(width * height * 3);
-  const count = width * height;
-  for (let i = 0; i < count; i += 1) {
+  for (let i = 0; i < width * height; i += 1) {
     const src = i * 4;
     const dst = i * 3;
     out[dst] = pixels[src] / 255;
@@ -363,8 +334,7 @@ function rgbaToNchwUint8(pixels: Uint8ClampedArray, width: number, height: numbe
 
 function rgbaToNhwcUint8(pixels: Uint8ClampedArray, width: number, height: number) {
   const out = new Uint8Array(width * height * 3);
-  const count = width * height;
-  for (let i = 0; i < count; i += 1) {
+  for (let i = 0; i < width * height; i += 1) {
     const src = i * 4;
     const dst = i * 3;
     out[dst] = pixels[src];
@@ -379,7 +349,6 @@ function nchwFloatToRgbaUint8(data: Float32Array, width: number, height: number)
   const out = new Uint8ClampedArray(channelSize * 4);
   const appearsByteRange = data.some((v) => v > 1.1 || v < 0);
   const scale = appearsByteRange ? 1 : 255;
-
   for (let i = 0; i < channelSize; i += 1) {
     const dst = i * 4;
     out[dst] = clamp255(data[i] * scale);
@@ -394,7 +363,6 @@ function nhwcFloatToRgbaUint8(data: Float32Array, width: number, height: number)
   const out = new Uint8ClampedArray(width * height * 4);
   const appearsByteRange = data.some((v) => v > 1.1 || v < 0);
   const scale = appearsByteRange ? 1 : 255;
-
   for (let i = 0; i < width * height; i += 1) {
     const src = i * 3;
     const dst = i * 4;
@@ -432,24 +400,16 @@ function nhwcUint8ToRgbaUint8(data: Uint8Array, width: number, height: number) {
   return out;
 }
 
-function runFallback(
-  pixels: Uint8ClampedArray,
-  width: number,
-  height: number,
-  rect: InpaintRect,
-) {
+function runFallback(pixels: Uint8ClampedArray, width: number, height: number, mask: Uint8Array) {
   const out = new Uint8ClampedArray(pixels);
-  const x0 = Math.max(0, Math.floor(rect.x));
-  const y0 = Math.max(0, Math.floor(rect.y));
-  const rectW = Math.max(1, Math.floor(rect.width));
-  const rectH = Math.max(1, Math.floor(rect.height));
-  const x1 = Math.min(width, x0 + rectW);
-  const y1 = Math.min(height, y0 + rectH);
-  const iterations = Math.min(80, Math.max(24, Math.floor(Math.max(rectW, rectH) / 3)));
+  const bbox = findMaskBounds(mask, width, height);
+  if (!bbox) return out;
 
+  const iterations = Math.min(80, Math.max(24, Math.floor(Math.max(bbox.width, bbox.height) / 3)));
   for (let iter = 0; iter < iterations; iter += 1) {
-    for (let y = y0; y < y1; y += 1) {
-      for (let x = x0; x < x1; x += 1) {
+    for (let y = bbox.y; y < bbox.y + bbox.height; y += 1) {
+      for (let x = bbox.x; x < bbox.x + bbox.width; x += 1) {
+        if (mask[y * width + x] === 0) continue;
         const idx = (y * width + x) * 4;
         let r = 0;
         let g = 0;
@@ -467,8 +427,7 @@ function runFallback(
         ];
         for (const [nx, ny] of neighbors) {
           if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const inRect = nx >= x0 && nx < x1 && ny >= y0 && ny < y1;
-          if (iter === 0 && inRect) continue;
+          if (iter === 0 && mask[ny * width + nx] > 0) continue;
           const nIdx = (ny * width + nx) * 4;
           r += out[nIdx];
           g += out[nIdx + 1];
@@ -485,6 +444,114 @@ function runFallback(
     }
   }
   return out;
+}
+
+function resizeRgba(
+  pixels: Uint8ClampedArray,
+  srcWidth: number,
+  srcHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+) {
+  const srcCanvas = new OffscreenCanvas(srcWidth, srcHeight);
+  const srcCtx = srcCanvas.getContext("2d");
+  if (!srcCtx) return pixels;
+  const copied = new Uint8ClampedArray(pixels);
+  srcCtx.putImageData(new ImageData(copied, srcWidth, srcHeight), 0, 0);
+  const targetCanvas = new OffscreenCanvas(targetWidth, targetHeight);
+  const targetCtx = targetCanvas.getContext("2d");
+  if (!targetCtx) return pixels;
+  targetCtx.drawImage(srcCanvas, 0, 0, targetWidth, targetHeight);
+  return targetCtx.getImageData(0, 0, targetWidth, targetHeight).data;
+}
+
+function resizeMask(
+  mask: Uint8Array,
+  srcWidth: number,
+  srcHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+) {
+  const out = new Uint8Array(targetWidth * targetHeight);
+  for (let y = 0; y < targetHeight; y += 1) {
+    const sy = Math.min(srcHeight - 1, Math.floor((y / targetHeight) * srcHeight));
+    for (let x = 0; x < targetWidth; x += 1) {
+      const sx = Math.min(srcWidth - 1, Math.floor((x / targetWidth) * srcWidth));
+      out[y * targetWidth + x] = mask[sy * srcWidth + sx];
+    }
+  }
+  return out;
+}
+
+function fillMaskOnRgba(pixels: Uint8ClampedArray, mask: Uint8Array, fill: number) {
+  const out = new Uint8ClampedArray(pixels);
+  for (let i = 0; i < mask.length; i += 1) {
+    if (mask[i] === 0) continue;
+    const idx = i * 4;
+    out[idx] = fill;
+    out[idx + 1] = fill;
+    out[idx + 2] = fill;
+    out[idx + 3] = 255;
+  }
+  return out;
+}
+
+function compositeInsideMask(
+  original: Uint8ClampedArray,
+  generated: Uint8ClampedArray,
+  mask: Uint8Array,
+) {
+  const out = new Uint8ClampedArray(original);
+  for (let i = 0; i < mask.length; i += 1) {
+    if (mask[i] === 0) continue;
+    const idx = i * 4;
+    out[idx] = generated[idx];
+    out[idx + 1] = generated[idx + 1];
+    out[idx + 2] = generated[idx + 2];
+    out[idx + 3] = 255;
+  }
+  return out;
+}
+
+function hasMeaningfulChangeInMask(
+  before: Uint8ClampedArray,
+  after: Uint8ClampedArray,
+  mask: Uint8Array,
+) {
+  let changed = 0;
+  let total = 0;
+  for (let i = 0; i < mask.length; i += 1) {
+    if (mask[i] === 0) continue;
+    const idx = i * 4;
+    const diff =
+      Math.abs(before[idx] - after[idx]) +
+      Math.abs(before[idx + 1] - after[idx + 1]) +
+      Math.abs(before[idx + 2] - after[idx + 2]);
+    if (diff > 10) changed += 1;
+    total += 1;
+  }
+  if (total === 0) return false;
+  return changed / total > 0.005;
+}
+
+function findMaskBounds(mask: Uint8Array, width: number, height: number) {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (mask[y * width + x] === 0) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+  return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
 }
 
 function getModelInputSize(
@@ -519,109 +586,6 @@ function inferTensorLayout(
   if (second === 1) return "nchw";
   if (fourth === 1) return "nhwc";
   return preferNhwc ? "nhwc" : "nchw";
-}
-
-function resizeRgba(
-  pixels: Uint8ClampedArray,
-  srcWidth: number,
-  srcHeight: number,
-  targetWidth: number,
-  targetHeight: number,
-) {
-  const srcCanvas = new OffscreenCanvas(srcWidth, srcHeight);
-  const srcCtx = srcCanvas.getContext("2d");
-  if (!srcCtx) return pixels;
-  srcCtx.putImageData(new ImageData(pixels, srcWidth, srcHeight), 0, 0);
-
-  const targetCanvas = new OffscreenCanvas(targetWidth, targetHeight);
-  const targetCtx = targetCanvas.getContext("2d");
-  if (!targetCtx) return pixels;
-  targetCtx.drawImage(srcCanvas, 0, 0, targetWidth, targetHeight);
-  return targetCtx.getImageData(0, 0, targetWidth, targetHeight).data;
-}
-
-function compositeInsideRect(
-  original: Uint8ClampedArray,
-  generated: Uint8ClampedArray,
-  width: number,
-  height: number,
-  rect: InpaintRect,
-) {
-  const out = new Uint8ClampedArray(original);
-  const x0 = Math.max(0, Math.floor(rect.x));
-  const y0 = Math.max(0, Math.floor(rect.y));
-  const rectW = Math.max(1, Math.floor(rect.width));
-  const rectH = Math.max(1, Math.floor(rect.height));
-  const x1 = Math.min(width, x0 + rectW);
-  const y1 = Math.min(height, y0 + rectH);
-
-  for (let y = y0; y < y1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      const idx = (y * width + x) * 4;
-      out[idx] = generated[idx];
-      out[idx + 1] = generated[idx + 1];
-      out[idx + 2] = generated[idx + 2];
-      out[idx + 3] = 255;
-    }
-  }
-  return out;
-}
-
-function fillRectOnRgba(
-  pixels: Uint8ClampedArray,
-  width: number,
-  height: number,
-  rect: InpaintRect,
-  fill: number,
-) {
-  const out = new Uint8ClampedArray(pixels);
-  const x0 = Math.max(0, Math.floor(rect.x));
-  const y0 = Math.max(0, Math.floor(rect.y));
-  const rectW = Math.max(1, Math.floor(rect.width));
-  const rectH = Math.max(1, Math.floor(rect.height));
-  const x1 = Math.min(width, x0 + rectW);
-  const y1 = Math.min(height, y0 + rectH);
-  for (let y = y0; y < y1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      const idx = (y * width + x) * 4;
-      out[idx] = fill;
-      out[idx + 1] = fill;
-      out[idx + 2] = fill;
-      out[idx + 3] = 255;
-    }
-  }
-  return out;
-}
-
-function hasMeaningfulChangeInRect(
-  before: Uint8ClampedArray,
-  after: Uint8ClampedArray,
-  width: number,
-  height: number,
-  rect: InpaintRect,
-) {
-  const x0 = Math.max(0, Math.floor(rect.x));
-  const y0 = Math.max(0, Math.floor(rect.y));
-  const rectW = Math.max(1, Math.floor(rect.width));
-  const rectH = Math.max(1, Math.floor(rect.height));
-  const x1 = Math.min(width, x0 + rectW);
-  const y1 = Math.min(height, y0 + rectH);
-
-  let changed = 0;
-  let total = 0;
-  for (let y = y0; y < y1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      const idx = (y * width + x) * 4;
-      const diff =
-        Math.abs(before[idx] - after[idx]) +
-        Math.abs(before[idx + 1] - after[idx + 1]) +
-        Math.abs(before[idx + 2] - after[idx + 2]);
-      if (diff > 10) changed += 1;
-      total += 1;
-    }
-  }
-  if (total === 0) return false;
-  return changed / total > 0.005;
 }
 
 function clamp255(value: number) {

@@ -1,12 +1,5 @@
 export type InpaintBackend = "webgpu" | "wasm" | "fallback";
 
-export type InpaintRect = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
 export type InpaintInitResult = {
   ready: boolean;
   backend: InpaintBackend;
@@ -33,7 +26,7 @@ export type InpaintWorkerRequest =
       width: number;
       height: number;
       pixels: Uint8ClampedArray;
-      rect: InpaintRect;
+      mask: Uint8Array;
     };
 
 export type InpaintWorkerResponse =
